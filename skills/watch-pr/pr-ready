@@ -22,7 +22,7 @@
 # Exit codes, for use in loops: 0 READY or MERGED, 1 BLOCKED or CLOSED (needs a person or a fix),
 # 2 WAITING (poll again), 3 usage or API error.
 #
-#   until pr-ready hue 202; [ $? -ne 2 ]; do sleep 60; done
+#   until pr-ready my-app 42; [ $? -ne 2 ]; do sleep 60; done
 
 set -uo pipefail
 
