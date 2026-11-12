@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# pr-ready <repo> <n> [--merge]
+#
+# Prints one status line for a pull request, saying whether it can be merged:
+#
+#   <owner/repo>#<n> READY|WAITING|BLOCKED|MERGED|CLOSED head=<sha> checks=… threads=… reviews=… merge=… [| reasons]
+#
+# READY means: the head commit was pushed at least a minute ago, no check failing or pending,
+# Copilot has reviewed the head commit when the base branch's rulesets require it, no open review
+# thread, no new PR comment from anyone but the author, no pending review request, and GitHub
+# reports the merge state as CLEAN or HAS_HOOKS.
+#
+# A review bot that shows its progress as a check (queued, then in progress) needs no entry here:
+# its pending check keeps the PR WAITING. The one-minute rule covers the gap between a push and a
+# bot's check appearing. The push time is when GitHub created the commit's first check suite.
+#
+# --merge rebase-merges a READY PR (deleting its branch), pinned to the head commit it checked,
+# and always prints what `gh pr merge` said. It merges nothing that isn't READY.
+#
+# <repo> is `owner/name`, or a bare name resolved against the current directory's repo owner.
+#
+# Exit codes, for use in loops: 0 READY or MERGED, 1 BLOCKED or CLOSED (needs a person or a fix),
+# 2 WAITING (poll again), 3 usage or API error.
+#
+#   until pr-ready hue 202; [ $? -ne 2 ]; do sleep 60; done
+
+set -uo pipefail
+
+COPILOT_LOGIN="copilot-pull-request-reviewer"
+SETTLE_SECONDS=60
+
+die() { echo "pr-ready: $*" >&2; exit 3; }
+
+[ $# -ge 2 ] || die "usage: pr-ready <repo> <n> [--merge]"
+repo=$1 n=$2 merge=${3:-}
+[[ $n =~ ^[0-9]+$ ]] || die "PR number must be numeric: $n"
+[ -z "$merge" ] || [ "$merge" = --merge ] || die "unknown option: $merge"
+if [[ $repo != */* ]]; then
+  owner=$(gh repo view --json owner --jq .owner.login 2>/dev/null) ||
+    die "bare repo name '$repo' needs to run inside a clone; pass owner/name instead"
+  repo="$owner/$repo"
+fi
+owner=${repo%%/*} name=${repo#*/}
+
+pr=$(gh api graphql -F n="$n" -f o="$owner" -f r="$name" -f query='
+  query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){
+    state isDraft mergeStateStatus headRefOid baseRefName author{login}
+    commits(last:1){nodes{commit{committedDate}}}
+    reviewThreads(first:100){nodes{isResolved}}
+    reviews(last:100){nodes{author{login} commit{oid}}}
+    reviewRequests(first:20){nodes{requestedReviewer{
+      ... on User{login} ... on Bot{login} ... on Team{slug}}}}
+    comments(last:50){nodes{author{__typename login} createdAt}}
+  }}}' --jq '.data.repository.pullRequest' 2>&1) || die "GraphQL query failed: $pr"
+[ "$pr" != null ] || die "$repo#$n not found"
+q() { jq -r "$1" <<<"$pr"; }
+
+state=$(q .state)
+head=$(q .headRefOid)
+line="$repo#$n"
+if [ "$state" = MERGED ] || [ "$state" = CLOSED ]; then
+  echo "$line $state head=${head:0:9}"
+  [ "$state" = MERGED ] && exit 0 || exit 1
+fi
+
+# Checks. `gh pr checks` exits non-zero while anything is pending or failing, so ignore its status.
+checks=$(gh pr checks "$n" -R "$repo" --json name,bucket 2>/dev/null || true)
+[ -n "$checks" ] || checks='[]'
+failing=$(jq -r '[.[]|select(.bucket=="fail" or .bucket=="cancel")|.name]|join(",")' <<<"$checks")
+pending=$(jq -r '[.[]|select(.bucket=="pending")]|length' <<<"$checks")
+if [ -n "$failing" ]; then checks_s="fail:$failing"
+elif [ "$pending" -gt 0 ]; then checks_s="pending:$pending"
+else checks_s=green; fi
+
+# Copilot posts no check while it reviews, so when the base branch's rulesets require it, wait
+# for its review of the head commit.
+reviews_s=none-expected missing=()
+rules=$(gh api "repos/$repo/rules/branches/$(q .baseRefName)" --jq '[.[].type]|join(",")' 2>/dev/null || true)
+if [[ ,$rules, == *,copilot_code_review,* ]]; then
+  if jq -e --arg b "$COPILOT_LOGIN" --arg h "$head" \
+      'any(.reviews.nodes[]; .author.login==$b and .commit.oid==$h)' <<<"$pr" >/dev/null; then
+    reviews_s=copilot:ok
+  else
+    reviews_s=copilot:waiting missing+=(copilot)
+  fi
+fi
+
+# Seconds since the head commit was pushed: GitHub creates its check suites as the push arrives,
+# so the earliest one's creation time stands in for it. None yet means it was pushed just now.
+pushed=$(gh api "repos/$repo/commits/$head/check-suites" \
+  --jq '[.check_suites[].created_at]|min // empty' 2>/dev/null || true)
+if [ -n "$pushed" ]; then
+  pushed_epoch=$(jq -rn --arg t "$pushed" '$t|fromdateiso8601')
+  age=$(( $(date +%s) - pushed_epoch ))
+else
+  age=0
+fi
+
+open_threads=$(q '[.reviewThreads.nodes[]|select(.isResolved|not)]|length')
+requested=$(q '[.reviewRequests.nodes[].requestedReviewer|(.login // .slug)]|join(",")')
+# PR comments (not review threads) since the head commit, from people other than the author. Bot
+# accounts are skipped: their PR comments are boilerplate (Shortcut links, Dependabot notices),
+# and review bots raise findings as review threads, which are counted above.
+new_comments=$(jq -r '(.commits.nodes[0].commit.committedDate) as $t | .author.login as $a |
+  [.comments.nodes[]|select(.createdAt > $t and .author.login != $a
+    and .author.__typename != "Bot")]|length' <<<"$pr")
+# GitHub works out mergeability lazily, so an idle PR reports UNKNOWN until someone asks.
+merge_state=$(q .mergeStateStatus)
+for _ in 1 2 3; do
+  [ "$merge_state" = UNKNOWN ] || break
+  sleep 3
+  merge_state=$(gh pr view "$n" -R "$repo" --json mergeStateStatus --jq .mergeStateStatus 2>/dev/null || echo UNKNOWN)
+done
+draft=$(q .isDraft)
+
+blocked=() waiting=()
+[ -n "$failing" ] && blocked+=("failing checks: $failing")
+[ "$open_threads" -gt 0 ] && blocked+=("$open_threads open review thread(s)")
+[ "$new_comments" -gt 0 ] && blocked+=("$new_comments new PR comment(s)")
+[ "$draft" = true ] && blocked+=("draft")
+case $merge_state in
+  DIRTY) blocked+=("merge conflicts") ;;
+  BEHIND) blocked+=("behind base; update the branch") ;;
+esac
+if [ -z "$pushed" ]; then
+  waiting+=("just pushed, no checks yet; review bots may not have started")
+elif [ "$age" -lt "$SETTLE_SECONDS" ]; then
+  waiting+=("pushed ${age}s ago; review bots may not have started")
+fi
+[ "$pending" -gt 0 ] && waiting+=("$pending check(s) pending")
+[ ${#missing[@]} -gt 0 ] && waiting+=("waiting on review: ${missing[*]}")
+[ -n "$requested" ] && waiting+=("review requested from $requested")
+[ "$merge_state" = UNKNOWN ] && waiting+=("GitHub still computing merge state")
+if [ ${#blocked[@]} -eq 0 ] && [ ${#waiting[@]} -eq 0 ]; then
+  case $merge_state in
+    CLEAN|HAS_HOOKS) ;;
+    BLOCKED) blocked+=("base branch policy blocks the merge (see the repo's rulesets)") ;;
+    *) blocked+=("merge state $merge_state") ;;
+  esac
+fi
+
+if [ ${#blocked[@]} -gt 0 ]; then verdict=BLOCKED reasons=("${blocked[@]}" ${waiting[@]+"${waiting[@]}"})
+elif [ ${#waiting[@]} -gt 0 ]; then verdict=WAITING reasons=("${waiting[@]}")
+else verdict=READY reasons=(); fi
+
+status="$line $verdict head=${head:0:9} checks=$checks_s threads=$open_threads reviews=$reviews_s merge=$merge_state"
+if [ ${#reasons[@]} -gt 0 ]; then
+  joined=$(printf '%s; ' "${reasons[@]}")
+  status+=" | ${joined%; }"
+fi
+echo "$status"
+
+if [ "$merge" != --merge ]; then
+  case $verdict in READY) exit 0 ;; WAITING) exit 2 ;; *) exit 1 ;; esac
+fi
+[ "$verdict" = READY ] || { echo "$line not merged: $verdict"; case $verdict in WAITING) exit 2 ;; *) exit 1 ;; esac; }
+
+out=$(gh pr merge "$n" -R "$repo" --rebase --delete-branch --match-head-commit "$head" 2>&1)
+rc=$?
+[ -n "$out" ] && sed 's/^/  gh: /' <<<"$out"
+after=$(gh pr view "$n" -R "$repo" --json state --jq .state 2>/dev/null || echo unknown)
+if [ "$after" = MERGED ]; then
+  echo "$line MERGED head=${head:0:9}"
+  exit 0
+fi
+echo "$line merge FAILED (gh exit $rc, state $after)"
+if [[ $out == *"without \`workflow\` scope"* ]]; then
+  echo "  hint: the gh token lacks the workflow scope. Run: gh auth refresh -h github.com -s workflow,"
+  echo "        or rebase the branch locally and push over git so the merge is a fast-forward."
+elif [[ $out == *"base branch policy"* ]]; then
+  echo "  hint: see why with: gh api \"repos/$repo/rulesets/rule-suites?ref=refs/heads/$(q .baseRefName)&time_period=hour\""
+fi
+exit 1
