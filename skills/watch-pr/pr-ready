@@ -11,15 +11,18 @@
 # pending review request, and GitHub reports the merge state as CLEAN or HAS_HOOKS.
 #
 # Review bodies: a reviewer can raise findings in the review's own text, with no thread to resolve
-# (Oscar does this for findings outside the diff). Each reviewer's latest review blocks when it
-# requests changes, or when it has a body that isn't a known all-clear and the PR author hasn't
-# commented since. Copilot is exempt: its findings arrive as threads, and its body is an overview.
-# Oscar's all-clear starts with a check mark. A reviewer's newer review supersedes the older one.
+# (review bots do this for findings outside the diff). A review blocks while its reviewer's latest
+# verdict requests changes, or while it has a body that doesn't start with ✅ (an all-clear), the
+# PR author hasn't commented since, and the reviewer hasn't approved since. A later all-clear doesn't
+# answer it: bots review incrementally, so ✅ on a later push means nothing new, not that the earlier
+# finding was handled. Copilot is exempt: its findings arrive as threads, and its body is an overview.
+#
+# Notes: a check that completed neutral or skipped passes, but its description can say why (a bot's
+# review delayed or failed, so nothing was reviewed). Each one with a description is listed after
+# the verdict as `note:`, without changing it, so whoever merges can read it first.
 #
 # A review bot that shows its progress as a check (queued, then in progress) needs no entry here:
-# its pending check keeps the PR WAITING. Oscar's `oscar/review` check is one: it stays in progress
-# until its review is posted, then completes `neutral` whatever it found, which `gh` buckets as
-# skipping, so its findings are judged from the review body, not the check. The one-minute rule covers the gap between a push and a
+# its pending check keeps the PR WAITING. The one-minute rule covers the gap between a push and a
 # bot's check appearing. The push time is when GitHub created the commit's first check suite.
 #
 # --merge rebase-merges a READY PR (deleting its branch), pinned to the head commit it checked,
@@ -72,7 +75,7 @@ if [ "$state" = MERGED ] || [ "$state" = CLOSED ]; then
 fi
 
 # Checks. `gh pr checks` exits non-zero while anything is pending or failing, so ignore its status.
-checks=$(gh pr checks "$n" -R "$repo" --json name,bucket 2>/dev/null || true)
+checks=$(gh pr checks "$n" -R "$repo" --json name,bucket,description 2>/dev/null || true)
 [ -n "$checks" ] || checks='[]'
 failing=$(jq -r '[.[]|select(.bucket=="fail" or .bucket=="cancel")|.name]|join(",")' <<<"$checks")
 pending=$(jq -r '[.[]|select(.bucket=="pending")]|length' <<<"$checks")
@@ -112,17 +115,20 @@ requested=$(q '[.reviewRequests.nodes[].requestedReviewer|(.login // .slug)]|joi
 new_comments=$(jq -r '(.commits.nodes[0].commit.committedDate) as $t | .author.login as $a |
   [.comments.nodes[]|select(.createdAt > $t and .author.login != $a
     and .author.__typename != "Bot")]|length' <<<"$pr")
-# Reviewers whose latest review needs an answer (see the header).
+# Reviewers with a review that needs an answer (see the header).
 review_bodies=$(jq -r --arg cp "$COPILOT_LOGIN" '.author.login as $a |
   ([.comments.nodes[]|select(.author.login==$a)|.createdAt]|max) as $replied |
-  [.reviews.nodes|map(select(.state!="PENDING" and .state!="DISMISSED" and .author.login!=$a))
-    |group_by(.author.login)[]|max_by(.submittedAt)
-    |select(.author.login!=$cp)
-    |select(.state=="CHANGES_REQUESTED" or
-      (.state=="COMMENTED" and (.body|test("\\S"))
-        and ((.body|contains("<!-- oscar-review:")) and (.body|ltrimstr("\n")|startswith("✅")))==false
-        and ($replied==null or .submittedAt > $replied)))
-    |.author.login]|join(",")' <<<"$pr")
+  [.reviews.nodes[]|select(.author.login!=$a and .author.login!=$cp)] as $rs |
+  ([$rs[]|select(.state=="CHANGES_REQUESTED" or .state=="APPROVED")]|group_by(.author.login)
+    |map(max_by(.submittedAt))) as $verdicts |
+  ([$verdicts[]|select(.state=="CHANGES_REQUESTED")|.author.login]
+   + [$rs[]|select(.state=="COMMENTED" and (.body|test("\\S"))
+        and (.body|ltrimstr("\n")|startswith("✅")|not)
+        and ($replied==null or .submittedAt > $replied)) as $r
+      |select(any($verdicts[]; .author.login==$r.author.login and .state=="APPROVED"
+        and .submittedAt > $r.submittedAt)|not)|$r.author.login])|unique|join(",")' <<<"$pr")
+notes=$(jq -r '[.[]|select(.bucket=="skipping" and (.description//"")!="")
+  |"note: skipped \(.name): \(.description)"]|join("; ")' <<<"$checks")
 # GitHub works out mergeability lazily, so an idle PR reports UNKNOWN until someone asks.
 merge_state=$(q .mergeStateStatus)
 for _ in 1 2 3; do
@@ -168,6 +174,7 @@ if [ ${#reasons[@]} -gt 0 ]; then
   joined=$(printf '%s; ' "${reasons[@]}")
   status+=" | ${joined%; }"
 fi
+[ -n "$notes" ] && status+=" | $notes"
 echo "$status"
 
 if [ "$merge" != --merge ]; then
