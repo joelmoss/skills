@@ -7,11 +7,19 @@
 #
 # READY means: the head commit was pushed at least a minute ago, no check failing or pending,
 # Copilot has reviewed the head commit when the base branch's rulesets require it, no open review
-# thread, no new PR comment from anyone but the author, no pending review request, and GitHub
-# reports the merge state as CLEAN or HAS_HOOKS.
+# thread, no unanswered review body (see below), no new PR comment from anyone but the author, no
+# pending review request, and GitHub reports the merge state as CLEAN or HAS_HOOKS.
+#
+# Review bodies: a reviewer can raise findings in the review's own text, with no thread to resolve
+# (Oscar does this for findings outside the diff). Each reviewer's latest review blocks when it
+# requests changes, or when it has a body that isn't a known all-clear and the PR author hasn't
+# commented since. Copilot is exempt: its findings arrive as threads, and its body is an overview.
+# Oscar's all-clear starts with a check mark. A reviewer's newer review supersedes the older one.
 #
 # A review bot that shows its progress as a check (queued, then in progress) needs no entry here:
-# its pending check keeps the PR WAITING. The one-minute rule covers the gap between a push and a
+# its pending check keeps the PR WAITING. Oscar's `oscar/review` check is one: it stays in progress
+# until its review is posted, then completes `neutral` whatever it found, which `gh` buckets as
+# skipping, so its findings are judged from the review body, not the check. The one-minute rule covers the gap between a push and a
 # bot's check appearing. The push time is when GitHub created the commit's first check suite.
 #
 # --merge rebase-merges a READY PR (deleting its branch), pinned to the head commit it checked,
@@ -47,7 +55,7 @@ pr=$(gh api graphql -F n="$n" -f o="$owner" -f r="$name" -f query='
     state isDraft mergeStateStatus headRefOid baseRefName author{login}
     commits(last:1){nodes{commit{committedDate}}}
     reviewThreads(first:100){nodes{isResolved}}
-    reviews(last:100){nodes{author{login} commit{oid}}}
+    reviews(last:100){nodes{author{login} commit{oid} state body submittedAt}}
     reviewRequests(first:20){nodes{requestedReviewer{
       ... on User{login} ... on Bot{login} ... on Team{slug}}}}
     comments(last:50){nodes{author{__typename login} createdAt}}
@@ -104,6 +112,17 @@ requested=$(q '[.reviewRequests.nodes[].requestedReviewer|(.login // .slug)]|joi
 new_comments=$(jq -r '(.commits.nodes[0].commit.committedDate) as $t | .author.login as $a |
   [.comments.nodes[]|select(.createdAt > $t and .author.login != $a
     and .author.__typename != "Bot")]|length' <<<"$pr")
+# Reviewers whose latest review needs an answer (see the header).
+review_bodies=$(jq -r --arg cp "$COPILOT_LOGIN" '.author.login as $a |
+  ([.comments.nodes[]|select(.author.login==$a)|.createdAt]|max) as $replied |
+  [.reviews.nodes|map(select(.state!="PENDING" and .state!="DISMISSED" and .author.login!=$a))
+    |group_by(.author.login)[]|max_by(.submittedAt)
+    |select(.author.login!=$cp)
+    |select(.state=="CHANGES_REQUESTED" or
+      (.state=="COMMENTED" and (.body|test("\\S"))
+        and ((.body|contains("<!-- oscar-review:")) and (.body|ltrimstr("\n")|startswith("✅")))==false
+        and ($replied==null or .submittedAt > $replied)))
+    |.author.login]|join(",")' <<<"$pr")
 # GitHub works out mergeability lazily, so an idle PR reports UNKNOWN until someone asks.
 merge_state=$(q .mergeStateStatus)
 for _ in 1 2 3; do
@@ -117,6 +136,7 @@ blocked=() waiting=()
 [ -n "$failing" ] && blocked+=("failing checks: $failing")
 [ "$open_threads" -gt 0 ] && blocked+=("$open_threads open review thread(s)")
 [ "$new_comments" -gt 0 ] && blocked+=("$new_comments new PR comment(s)")
+[ -n "$review_bodies" ] && blocked+=("unanswered review from $review_bodies")
 [ "$draft" = true ] && blocked+=("draft")
 case $merge_state in
   DIRTY) blocked+=("merge conflicts") ;;
